@@ -4,6 +4,6 @@
 *.gif
 *.bmp
 *.tiff
-
+*.pyc
 fastscnn_env/
 data/
