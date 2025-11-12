@@ -17,10 +17,20 @@ class FastSCNN(nn.Module):
     def __init__(self, num_classes, aux=False, **kwargs):
         super(FastSCNN, self).__init__()
         self.aux = aux
+        
+        # Primeira etapa: reduz a resolução e extrai características iniciais
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
+        
+        # Extrai características globais profundas (contexto da imagem)
         self.global_feature_extractor = GlobalFeatureExtractor(64, [64, 96, 128], 128, 6, [3, 3, 3])
+        
+        # Funde características de alta e baixa resolução
         self.feature_fusion = FeatureFusionModule(64, 128, 128)
+       
+        # Classificador final: gera o mapa de classes
         self.classifier = Classifer(128, num_classes)
+        
+        # Camada auxiliar opcional para ajudar no treinamento
         if self.aux:
             self.auxlayer = nn.Sequential(
                 nn.Conv2d(64, 32, 3, padding=1, bias=False),
@@ -31,14 +41,26 @@ class FastSCNN(nn.Module):
             )
 
     def forward(self, x):
-        size = x.size()[2:]
+        size = x.size()[2:]  # Guarda o tamanho original da imagem
+       
+       # Extração de características iniciais e redução de resolução
         higher_res_features = self.learning_to_downsample(x)
+        
+        # Extração de características globais profundas
         x = self.global_feature_extractor(higher_res_features)
+        
+        # Fusão das características globais com as de alta resolução
         x = self.feature_fusion(higher_res_features, x)
+        
+        # Classificação pixel a pixel
         x = self.classifier(x)
         outputs = []
+       
+       # Redimensiona a saída para o tamanho original da imagem
         x = F.interpolate(x, size, mode='bilinear', align_corners=True)
         outputs.append(x)
+       
+        # Se usar saída auxiliar, adiciona ao output
         if self.aux:
             auxout = self.auxlayer(higher_res_features)
             auxout = F.interpolate(auxout, size, mode='bilinear', align_corners=True)
@@ -47,7 +69,7 @@ class FastSCNN(nn.Module):
 
 
 class _ConvBNReLU(nn.Module):
-    """Conv-BN-ReLU"""
+    """Bloco padrão: Convolução + BatchNorm + ReLU"""
 
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, **kwargs):
         super(_ConvBNReLU, self).__init__()
@@ -62,7 +84,7 @@ class _ConvBNReLU(nn.Module):
 
 
 class _DSConv(nn.Module):
-    """Depthwise Separable Convolutions"""
+    """Convolução separável em profundidade (Depthwise Separable) - eficiente para redes leves"""
 
     def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
         super(_DSConv, self).__init__()
@@ -80,6 +102,7 @@ class _DSConv(nn.Module):
 
 
 class _DWConv(nn.Module):
+    """Convolução depthwise (só separa canais, não mistura)"""
     def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
         super(_DWConv, self).__init__()
         self.conv = nn.Sequential(
@@ -93,17 +116,19 @@ class _DWConv(nn.Module):
 
 
 class LinearBottleneck(nn.Module):
-    """LinearBottleneck used in MobileNetV2"""
+    """Bloco LinearBottleneck (MobileNetV2): extrai características mantendo eficiência"""
 
     def __init__(self, in_channels, out_channels, t=6, stride=2, **kwargs):
         super(LinearBottleneck, self).__init__()
         self.use_shortcut = stride == 1 and in_channels == out_channels
-        self.block = nn.Sequential(
-            # pw
+        self.block = nn.Sequential( 
+            # pw: pointwise conv
             _ConvBNReLU(in_channels, in_channels * t, 1),
-            # dw
+            
+            # dw: depthwise conv
             _DWConv(in_channels * t, in_channels * t, stride),
-            # pw-linear
+            
+            # pw-linear: pointwise conv sem ativação
             nn.Conv2d(in_channels * t, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels)
         )
@@ -111,12 +136,12 @@ class LinearBottleneck(nn.Module):
     def forward(self, x):
         out = self.block(x)
         if self.use_shortcut:
-            out = x + out
+            out = x + out  # Atalho (residual)
         return out
 
 
 class PyramidPooling(nn.Module):
-    """Pyramid pooling module"""
+    """Módulo de pooling piramidal: agrega contexto global em diferentes escalas"""
 
     def __init__(self, in_channels, out_channels, **kwargs):
         super(PyramidPooling, self).__init__()
@@ -136,17 +161,21 @@ class PyramidPooling(nn.Module):
 
     def forward(self, x):
         size = x.size()[2:]
+        
+        # Pooling em diferentes escalas
         feat1 = self.upsample(self.conv1(self.pool(x, 1)), size)
         feat2 = self.upsample(self.conv2(self.pool(x, 2)), size)
         feat3 = self.upsample(self.conv3(self.pool(x, 3)), size)
         feat4 = self.upsample(self.conv4(self.pool(x, 6)), size)
+        
+        # Concatena as features de diferentes escalas
         x = torch.cat([x, feat1, feat2, feat3, feat4], dim=1)
         x = self.out(x)
         return x
 
 
 class LearningToDownsample(nn.Module):
-    """Learning to downsample module"""
+    """Módulo de redução de resolução e extração inicial de características"""
 
     def __init__(self, dw_channels1=32, dw_channels2=48, out_channels=64, **kwargs):
         super(LearningToDownsample, self).__init__()
@@ -162,14 +191,18 @@ class LearningToDownsample(nn.Module):
 
 
 class GlobalFeatureExtractor(nn.Module):
-    """Global feature extractor module"""
+    """Extrator de características globais: contexto profundo da imagem"""
 
     def __init__(self, in_channels=64, block_channels=(64, 96, 128),
                  out_channels=128, t=6, num_blocks=(3, 3, 3), **kwargs):
         super(GlobalFeatureExtractor, self).__init__()
+        
+        # Três blocos de LinearBottleneck (MobileNetV2)
         self.bottleneck1 = self._make_layer(LinearBottleneck, in_channels, block_channels[0], num_blocks[0], t, 2)
         self.bottleneck2 = self._make_layer(LinearBottleneck, block_channels[0], block_channels[1], num_blocks[1], t, 2)
         self.bottleneck3 = self._make_layer(LinearBottleneck, block_channels[1], block_channels[2], num_blocks[2], t, 1)
+        
+        # Pooling piramidal para contexto global
         self.ppm = PyramidPooling(block_channels[2], out_channels)
 
     def _make_layer(self, block, inplanes, planes, blocks, t=6, stride=1):
@@ -188,7 +221,7 @@ class GlobalFeatureExtractor(nn.Module):
 
 
 class FeatureFusionModule(nn.Module):
-    """Feature fusion module"""
+    """Módulo de fusão de características: combina detalhes e contexto"""
 
     def __init__(self, highter_in_channels, lower_in_channels, out_channels, scale_factor=4, **kwargs):
         super(FeatureFusionModule, self).__init__()
@@ -205,6 +238,8 @@ class FeatureFusionModule(nn.Module):
         self.relu = nn.ReLU(True)
 
     def forward(self, higher_res_feature, lower_res_feature):
+        
+        # Ajusta resolução e mistura características globais e locais
         lower_res_feature = F.interpolate(lower_res_feature, scale_factor=4, mode='bilinear', align_corners=True)
         lower_res_feature = self.dwconv(lower_res_feature)
         lower_res_feature = self.conv_lower_res(lower_res_feature)
@@ -215,7 +250,7 @@ class FeatureFusionModule(nn.Module):
 
 
 class Classifer(nn.Module):
-    """Classifer"""
+    """Classificador final: gera o mapa de classes para cada pixel"""
 
     def __init__(self, dw_channels, num_classes, stride=1, **kwargs):
         super(Classifer, self).__init__()
