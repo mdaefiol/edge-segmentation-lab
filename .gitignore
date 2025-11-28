@@ -9,3 +9,4 @@ fastscnn_cuda/
 data/
 *.json
 *.pth
+BiSeNet
